@@ -14,13 +14,9 @@ I2C_ADDR = 0x27
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RGB_R,   GPIO.OUT, initial=GPIO.HIGH)
 GPIO.setup(RGB_G,   GPIO.OUT, initial=GPIO.HIGH)
 GPIO.setup(RGB_B,   GPIO.OUT, initial=GPIO.HIGH)
-
-# Use PWM on red for amber mixing control
-GPIO.setup(RGB_R, GPIO.OUT, initial=GPIO.HIGH)
-pwm_r = GPIO.PWM(RGB_R, 1000)
-pwm_r.start(0)
 
 lcd = CharLCD(
     i2c_expander='PCF8574',
@@ -42,28 +38,15 @@ def get_key():
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return ch
 
-# Common anode: LOW=ON for G and B
-# Red uses PWM: duty 0=OFF, 100=full ON
-# Amber: red at ~30% duty + green fully ON
-def rgb_off():
-    pwm_r.ChangeDutyCycle(0)
-    GPIO.output(RGB_G, GPIO.HIGH)
-    GPIO.output(RGB_B, GPIO.HIGH)
+def rgb(r, g, b):
+    GPIO.output(RGB_R, GPIO.LOW  if r else GPIO.HIGH)
+    GPIO.output(RGB_G, GPIO.LOW  if g else GPIO.HIGH)
+    GPIO.output(RGB_B, GPIO.LOW  if b else GPIO.HIGH)
 
-def rgb_red():
-    pwm_r.ChangeDutyCycle(100)
-    GPIO.output(RGB_G, GPIO.HIGH)
-    GPIO.output(RGB_B, GPIO.HIGH)
-
-def rgb_green():
-    pwm_r.ChangeDutyCycle(0)
-    GPIO.output(RGB_G, GPIO.LOW)
-    GPIO.output(RGB_B, GPIO.HIGH)
-
-def rgb_amber():
-    pwm_r.ChangeDutyCycle(30)
-    GPIO.output(RGB_G, GPIO.LOW)
-    GPIO.output(RGB_B, GPIO.HIGH)
+def rgb_off():   rgb(0, 0, 0)
+def rgb_red():   rgb(1, 0, 0)
+def rgb_green(): rgb(0, 1, 0)
+def rgb_amber(): rgb(1, 1, 0)
 
 def blink(times=3):
     for i in range(times):
@@ -81,23 +64,23 @@ def show_lcd(line1, line2=""):
         lcd.cursor_pos = (1, 0)
         lcd.write_string(line2[:16])
 
-def set_state(name, fn):
-    fn()
-    show_lcd("Signal: " + name, "R G A  any=next")
-    print("State: " + name)
-
-STATES = ["Red", "Amber", "Green"]
-idx = 0
+STATES = [
+    ("Red",   "Signal: RED",   rgb_red),
+    ("Amber", "Signal: AMBER", rgb_amber),
+    ("Green", "Signal: GREEN", rgb_green),
+]
 
 print("Boot sequence...")
 blink()
 show_lcd("Hello World!", "J1 Gaborone")
 time.sleep(2)
 
-rgb_red()
-show_lcd("Signal: Red", "R G A  any=next")
-print("Current: Red")
-print("R=red  G=green  A=amber  any=next  q=quit")
+idx = 0
+name, lcd2, fn = STATES[idx]
+fn()
+show_lcd("Signal: " + name, "key=next  q=quit")
+print("Current: " + name)
+print("Any key = next   q = quit")
 
 try:
     while True:
@@ -105,26 +88,15 @@ try:
         if key == 'q' or key == '\x03':
             print("Exiting...")
             break
-        elif key == 'r' or key == 'R':
-            idx = 0
-            set_state("Red", rgb_red)
-        elif key == 'g' or key == 'G':
-            idx = 2
-            set_state("Green", rgb_green)
-        elif key == 'a' or key == 'A':
-            idx = 1
-            set_state("Amber", rgb_amber)
-        else:
-            idx = (idx + 1) % len(STATES)
-            name = STATES[idx]
-            fn = rgb_red if name == "Red" else rgb_green if name == "Green" else rgb_amber
-            set_state(name, fn)
-
+        idx = (idx + 1) % len(STATES)
+        name, lcd2, fn = STATES[idx]
+        fn()
+        show_lcd("Signal: " + name, "key=next  q=quit")
+        print("Toggled to: " + name)
 except Exception as e:
     print("Error: " + str(e))
 finally:
     rgb_off()
-    pwm_r.stop()
     GPIO.output(LED_PIN, GPIO.LOW)
     lcd.clear()
     GPIO.cleanup()
