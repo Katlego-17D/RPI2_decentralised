@@ -5,38 +5,26 @@ import tty
 import termios
 from RPLCD.i2c import CharLCD
 
-# ── Pin definitions ───────────────────────────────────────────────────────────
 LED_MONO = 17
-
-# RGB LED — common anode (links 7,8 — Arm A, Phase 2)
-RGB_R = 27
-RGB_G = 22
-RGB_B = 23
-
-# R/G + standalone amber — common cathode (links 5,6 — Arm D, Phase 6)
-D_RED   = 5
-D_GREEN = 6
-D_AMBER = 13
-
+RGB_R    = 27
+RGB_G    = 22
+RGB_B    = 23
+D_RED    = 5
+D_GREEN  = 6
+D_AMBER  = 13
 I2C_ADDR = 0x27
 
-# ── GPIO setup ────────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
 GPIO.setup(LED_MONO, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RGB_R,    GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(RGB_G,    GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(RGB_B,    GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(D_RED,    GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(D_GREEN,  GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(D_AMBER,  GPIO.OUT, initial=GPIO.LOW)
 
-# RGB common anode — HIGH=OFF, LOW=ON
-GPIO.setup(RGB_R, GPIO.OUT, initial=GPIO.HIGH)
-GPIO.setup(RGB_G, GPIO.OUT, initial=GPIO.HIGH)
-GPIO.setup(RGB_B, GPIO.OUT, initial=GPIO.HIGH)
-
-# Arm D common cathode — HIGH=ON, LOW=OFF
-GPIO.setup(D_RED,   GPIO.OUT, initial=GPIO.LOW)
-GPIO.setup(D_GREEN, GPIO.OUT, initial=GPIO.LOW)
-GPIO.setup(D_AMBER, GPIO.OUT, initial=GPIO.LOW)
-
-# ── LCD ───────────────────────────────────────────────────────────────────────
 lcd = CharLCD(
     i2c_expander='PCF8574',
     address=I2C_ADDR,
@@ -49,7 +37,6 @@ lcd = CharLCD(
     backlight_enabled=True,
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_key():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -74,12 +61,7 @@ def blink_boot(times=3):
         GPIO.output(LED_MONO, GPIO.LOW)
         time.sleep(0.5)
 
-# ── RGB (common anode) signal functions ──────────────────────────────────────
-def rgb_off():
-    GPIO.output(RGB_R, GPIO.HIGH)
-    GPIO.output(RGB_G, GPIO.HIGH)
-    GPIO.output(RGB_B, GPIO.HIGH)
-
+# ── RGB common anode: LOW=ON, HIGH=OFF ───────────────────────────────────────
 def rgb_red():
     GPIO.output(RGB_R, GPIO.LOW)
     GPIO.output(RGB_G, GPIO.HIGH)
@@ -95,12 +77,12 @@ def rgb_amber():
     GPIO.output(RGB_G, GPIO.LOW)
     GPIO.output(RGB_B, GPIO.HIGH)
 
-# ── Arm D (common cathode) signal functions ───────────────────────────────────
-def d_off():
-    GPIO.output(D_RED,   GPIO.LOW)
-    GPIO.output(D_GREEN, GPIO.LOW)
-    GPIO.output(D_AMBER, GPIO.LOW)
+def rgb_off():
+    GPIO.output(RGB_R, GPIO.HIGH)
+    GPIO.output(RGB_G, GPIO.HIGH)
+    GPIO.output(RGB_B, GPIO.HIGH)
 
+# ── Arm D common cathode: HIGH=ON, LOW=OFF ────────────────────────────────────
 def d_red():
     GPIO.output(D_RED,   GPIO.HIGH)
     GPIO.output(D_GREEN, GPIO.LOW)
@@ -116,27 +98,29 @@ def d_amber():
     GPIO.output(D_GREEN, GPIO.LOW)
     GPIO.output(D_AMBER, GPIO.HIGH)
 
-# ── Phase states ──────────────────────────────────────────────────────────────
-# Each entry: (phase_name, lcd_line2, rgb_fn, d_fn)
-# Based on actual TLS phases:
-#   Phase 0 (36s): D green      → Arm A red,   Arm D red
-#   Phase 1  (4s): yellow       → Arm A red,   Arm D red
-#   Phase 2 (25s): A+B green    → Arm A GREEN, Arm D red
-#   Phase 3  (4s): yellow       → Arm A AMBER, Arm D red
-#   Phase 4 (20s): B+C green    → Arm A red,   Arm D red
-#   Phase 5  (4s): yellow       → Arm A red,   Arm D red
-#   Phase 6 (36s): C+D green    → Arm A red,   Arm D GREEN
-#   Phase 7  (4s): yellow       → Arm A red,   Arm D AMBER
+def d_off():
+    GPIO.output(D_RED,   GPIO.LOW)
+    GPIO.output(D_GREEN, GPIO.LOW)
+    GPIO.output(D_AMBER, GPIO.LOW)
 
+# ── TLS phases ────────────────────────────────────────────────────────────────
+# Ph0: rrrGGrrrrrrr  links 3,4 green   → ArmA red,   ArmD red
+# Ph1: rrryyrrrrrrr  links 3,4 yellow  → ArmA red,   ArmD red
+# Ph2: rGGrrrrGGrrr  links 1,2,7,8 grn → ArmA GREEN, ArmD red
+# Ph3: ryyrrrryyrrr  links 1,2,7,8 yel → ArmA AMBER, ArmD red
+# Ph4: GrrrrrrrrrrG  links 0,11 green  → ArmA red,   ArmD red
+# Ph5: yrrrrrrrrrry  links 0,11 yellow → ArmA red,   ArmD red
+# Ph6: rrrrrGGrrGGr  links 5,6,9,10   → ArmA red,   ArmD GREEN
+# Ph7: rrrrryyrryyr  links 5,6,9,10 y → ArmA red,   ArmD AMBER
 PHASES = [
-    ("Ph0 D grn  36s", "ArmA:RED  ArmD:RED",   rgb_red,   d_red),
-    ("Ph1 Yellow  4s", "ArmA:RED  ArmD:RED",   rgb_red,   d_red),
-    ("Ph2 AB grn 25s", "ArmA:GRN  ArmD:RED",   rgb_green, d_red),
-    ("Ph3 Yellow  4s", "ArmA:AMB  ArmD:RED",   rgb_amber, d_red),
-    ("Ph4 BC grn 20s", "ArmA:RED  ArmD:RED",   rgb_red,   d_red),
-    ("Ph5 Yellow  4s", "ArmA:RED  ArmD:RED",   rgb_red,   d_red),
-    ("Ph6 CD grn 36s", "ArmA:RED  ArmD:GRN",   rgb_red,   d_green),
-    ("Ph7 Yellow  4s", "ArmA:RED  ArmD:AMB",   rgb_red,   d_amber),
+    ("Ph0 D    36s", "ArmA:RED  ArmD:RED", rgb_red,   d_red),
+    ("Ph1 Yel   4s", "ArmA:RED  ArmD:RED", rgb_red,   d_red),
+    ("Ph2 AB   25s", "ArmA:GRN  ArmD:RED", rgb_green, d_red),
+    ("Ph3 Yel   4s", "ArmA:AMB  ArmD:RED", rgb_amber, d_red),
+    ("Ph4 BC   20s", "ArmA:RED  ArmD:RED", rgb_red,   d_red),
+    ("Ph5 Yel   4s", "ArmA:RED  ArmD:RED", rgb_red,   d_red),
+    ("Ph6 CD   36s", "ArmA:RED  ArmD:GRN", rgb_red,   d_green),
+    ("Ph7 Yel   4s", "ArmA:RED  ArmD:AMB", rgb_red,   d_amber),
 ]
 
 def apply_phase(idx):
@@ -146,18 +130,15 @@ def apply_phase(idx):
     show_lcd(name, lcd2)
     print("Phase " + str(idx) + ": " + name)
 
-# ── Boot sequence ─────────────────────────────────────────────────────────────
-print("=== Boot sequence ===")
+# ── Boot ──────────────────────────────────────────────────────────────────────
+print("=== Boot ===")
 blink_boot()
 show_lcd("Hello World!", "J1 Gaborone")
 time.sleep(2)
 
-# Start at Phase 0
 idx = 0
 apply_phase(idx)
-print("")
-print("any key = next phase")
-print("q       = quit")
+print("any key=next  q=quit")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 try:
