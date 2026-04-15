@@ -226,11 +226,11 @@ def load_avid(csv_path, begin_s=0):
             a = (e + n + s) / 3.0      # Arm A estimated
 
             # Convert veh/15min to queue estimate
-            # Assume ~25% of arrivals are queued at any moment
-            q_b = round(e * 0.25, 1)
-            q_d = round(n * 0.25, 1)
-            q_c = round(s * 0.25, 1)
-            q_a = round(a * 0.25, 1)
+            # ~50% of arrivals queued during peak (AVID counts are per 15min)
+            q_b = round(e * 0.50, 1)
+            q_d = round(n * 0.50, 1)
+            q_c = round(s * 0.50, 1)
+            q_a = round(a * 0.50, 1)
 
             # Speed estimate: inverse of occupancy
             occ   = min((q_b + q_d + q_c + q_a) / 80.0, 1.0)
@@ -257,8 +257,8 @@ def load_avid(csv_path, begin_s=0):
 # =============================================================================
 PHASES_CYCLE  = [0, 2, 4, 6]
 MIN_GREEN_STEPS = 1   # in 15-min CSV steps (1 step = 15 min)
-MAX_GREEN_STEPS = 4
-SWITCHING_LOSS  = 2.0
+MAX_GREEN_STEPS = 3
+SWITCHING_LOSS  = 0.5  # lowered for AVID queue scale
 
 PHASE_MOVEMENTS = {
     0: [("D","out2",0.25), ("D","out2",0.25)],
@@ -372,7 +372,7 @@ class PhaseManager:
 
         want   = (requested != self.current and
                   self.elapsed >= MIN_GREEN_STEPS)
-        force  = (self.elapsed >= MAX_GREEN_STEPS)
+        force  = (self.elapsed >= MAX_GREEN_STEPS)  # force cycle after 3 steps
 
         if want or force:
             if force and not want:
