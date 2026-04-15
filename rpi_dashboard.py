@@ -101,18 +101,33 @@ def api_data():
 # ── Simulation thread ─────────────────────────────────────────────────────────
 def run_mode(mode, use_hardware, speed, begin_s, csv_path):
     src = HERE / 'output' / ('j1_v2_metrics_' + mode + '.json')
-    if src.exists():
-        src.unlink()
-
-    print("\n  [" + mode.upper() + "] Starting")
-
+    print("\n  [" + mode.upper() + "] Starting | hw=" + str(use_hardware))
     with LOCK:
         STATE[mode]['running'] = True
+    try:
+        demo.run(
+            mode         = mode,
+            speed        = speed,
+            csv_path     = str(csv_path),
+            begin_s      = begin_s,
+            no_hardware  = not use_hardware,
+            metrics_path = str(src),
+        )
+    except Exception as e:
+        print("  [" + mode.upper() + "] Error: " + str(e))
+        import traceback; traceback.print_exc()
+    try:
+        if src.exists():
+            with LOCK:
+                STATE[mode]['records'] = json.loads(src.read_text(encoding='utf-8'))
+                STATE[mode]['count']   = len(STATE[mode]['records'])
+    except Exception:
+        pass
+    with LOCK:
+        STATE[mode]['running'] = False
+        STATE[mode]['done']    = True
+    print("  [" + mode.upper() + "] Done — " + str(STATE[mode]['count']) + " steps")
 
-    # Run rpi_demo in a subprocess-like way using its run() function
-    # but in a thread — disable hardware for fixed/mp background modes
-    import threading
-    done_event = threading.Event()
 
     def sim_thread():
         try:
@@ -582,7 +597,7 @@ poll();
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--speed',    default=20, type=float,
+    p.add_argument('--speed',    default=60, type=float,
                    help='Playback speed (20=fast, 1=real time)')
     p.add_argument('--begin',    default=0, type=int,
                    help='Start time seconds (0=midnight, 25200=07:00)')
