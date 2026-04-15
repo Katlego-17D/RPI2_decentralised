@@ -1,417 +1,517 @@
+#!/usr/bin/env python3
 """
-rpi_demo.py  —  J1 Gaborone Hardware Demo
-==========================================
-Raspberry Pi 2 — inference only, no SUMO, no TraCI.
+rpi_demo.py  —  Adaptive Traffic Signal Demo on Raspberry Pi 2
+===============================================================
+Reads vehicle demand derived from 31 AVID Oct-2025 route files,
+simulates queue build-up per arm, runs Max-Pressure + DQN
+inference (no training), and drives 4 signal-head LED sets
+via GPIO.
 
-Reads j1_demand_15min.csv, runs Max Pressure or hybrid DRL,
-drives LEDs + LCD, logs metrics JSON for dashboard.
+Hardware (all LEDs common-cathode, HIGH = ON):
+  Phase 0  Arm D→out2  (links 3,4)   R=GPIO19  G=GPIO26  Y=GPIO21
+  Phase 2  Arm B→out1  (links 1,2)   R=GPIO20  G=GPIO16  Y=GPIO12
+  Phase 4  Arm B→out4  (link 0)      R=GPIO8   G=GPIO25  Y=GPIO24
+  Phase 6  Arm C→out3  (links 9,10)  R=GPIO7   G=GPIO9   Y=GPIO11
+  LCD 16×2 I²C at 0x27
+
+Modes:
+  fixed       — 30 s green each phase, round-robin
+  mp          — Max Pressure, picks highest-pressure phase
+  hybrid_drl  — DQN selects phase from queue state (inference only)
 
 Usage:
-    python3 rpi_demo.py                        # hybrid_drl, 30x speed
-    python3 rpi_demo.py --mode mp              # Max Pressure only
-    python3 rpi_demo.py --mode fixed           # Fixed time baseline
-    python3 rpi_demo.py --speed 60             # faster playback
-    python3 rpi_demo.py --begin 25200          # start at 07:00
-    python3 rpi_demo.py --no-hardware          # test without GPIO/LCD
+  python3 rpi_demo.py                        # hybrid_drl, 10× speed
+  python3 rpi_demo.py --mode fixed           # fixed baseline
+  python3 rpi_demo.py --mode mp              # max pressure only
+  python3 rpi_demo.py --speed 1              # real-time (slow)
+  python3 rpi_demo.py --no-hardware          # laptop/console test
 """
 
-import csv, time, argparse, math
+import time, argparse, math, sys
 from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).parent
 
-# =============================================================================
-#  GPIO + LCD  — imported only when hardware is available
-# =============================================================================
-def setup_hardware(use_hw):
-    """Returns (gpio_module, lcd_object) or (None, None) if no hardware."""
-    if not use_hw:
-        print("[INFO] Hardware disabled — console mode")
-        return None, None
-    try:
-        import RPi.GPIO as GPIO
-        from RPLCD.i2c import CharLCD
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        pins = [17,27,22,23,5,6,13,19,26,21,20,16,12,8,25,24,7,9,11]
-        GPIO.setup(17, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup(27, GPIO.OUT, initial=GPIO.HIGH)
-        GPIO.setup(22, GPIO.OUT, initial=GPIO.HIGH)
-        GPIO.setup(23, GPIO.OUT, initial=GPIO.HIGH)
-        for p in [5,6,13,19,26,21,20,16,12,8,25,24,7,9,11]:
-            GPIO.setup(p, GPIO.OUT, initial=GPIO.LOW)
-        lcd = CharLCD(
-            i2c_expander='PCF8574', address=0x27,
-            port=1, cols=16, rows=2, dotsize=8,
-            charmap='A02', auto_linebreaks=True, backlight_enabled=True,
-        )
-        return GPIO, lcd
-    except Exception as e:
-        print("[WARN] Hardware init failed: " + str(e) + " — console mode")
-        return None, None
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEMAND PROFILE — averaged from 31 SUMO route files (Oct 1–31, 2025)
+# Averaged from all 31 SUMO route files (Oct 1–31, 2025)
+# Each tuple: (seconds_into_day, A_vph, B_vph, C_vph, D_vph)
+# ═══════════════════════════════════════════════════════════════════════════════
+DEMAND = [
+    (    0, 120.6, 118.6, 118.6, 119.5),  # 00:00
+    (  900, 119.9, 118.1, 118.1, 118.2),  # 00:15
+    ( 1800, 111.5, 110.1, 110.1, 110.1),  # 00:30
+    ( 2700,  99.9,  98.0,  98.0,  97.9),  # 00:45
+    ( 3600,  91.8,  90.5,  90.5,  90.6),  # 01:00
+    ( 4500,  80.9,  79.1,  79.1,  79.6),  # 01:15
+    ( 5400,  71.1,  71.3,  71.3,  72.3),  # 01:30
+    ( 6300,  61.0,  58.9,  58.9,  59.5),  # 01:45
+    ( 7200,  59.4,  57.1,  57.1,  59.4),  # 02:00
+    ( 8100,  54.9,  52.3,  52.3,  54.4),  # 02:15
+    ( 9000,  48.0,  45.5,  45.5,  47.3),  # 02:30
+    ( 9900,  50.4,  47.8,  47.8,  49.8),  # 02:45
+    (10800,  48.5,  45.6,  45.6,  49.3),  # 03:00
+    (11700,  52.7,  50.6,  50.6,  51.5),  # 03:15
+    (12600,  53.3,  51.1,  51.1,  51.9),  # 03:30
+    (13500,  53.0,  50.2,  50.2,  52.9),  # 03:45
+    (14400,  59.9,  57.9,  57.9,  58.4),  # 04:00
+    (15300,  68.3,  66.4,  66.4,  66.5),  # 04:15
+    (16200,  82.9,  81.0,  81.0,  81.4),  # 04:30
+    (17100, 109.0, 106.8, 106.8, 107.1),  # 04:45
+    (18000, 128.0, 126.2, 126.2, 126.7),  # 05:00
+    (18900, 172.9, 170.9, 170.9, 171.8),  # 05:15
+    (19800, 253.2, 251.7, 251.7, 252.3),  # 05:30
+    (20700, 360.4, 359.2, 359.2, 359.9),  # 05:45
+    (21600, 547.3, 545.9, 545.9, 546.4),  # 06:00
+    (22500, 727.8, 726.8, 726.8, 727.2),  # 06:15
+    (23400, 869.8, 868.6, 868.6, 869.1),  # 06:30
+    (24300, 958.5, 957.4, 957.4, 958.0),  # 06:45
+    (25200, 984.1, 983.2, 983.2, 983.5),  # 07:00  ← AM peak
+    (26100, 974.1, 973.4, 973.4, 973.9),  # 07:15
+    (27000, 953.5, 953.0, 953.0, 953.4),  # 07:30
+    (27900, 915.9, 915.5, 915.5, 915.7),  # 07:45
+    (28800, 865.6, 865.2, 865.2, 865.6),  # 08:00
+    (29700, 828.3, 828.0, 828.0, 828.2),  # 08:15
+    (30600, 786.5, 786.1, 786.1, 786.3),  # 08:30
+    (31500, 780.4, 780.1, 780.1, 780.4),  # 08:45
+    (32400, 780.0, 779.9, 779.9, 780.0),  # 09:00
+    (33300, 778.2, 778.1, 778.1, 778.2),  # 09:15
+    (34200, 775.0, 775.0, 775.0, 775.0),  # 09:30
+    (35100, 802.7, 802.5, 802.5, 802.6),  # 09:45
+    (36000, 812.8, 812.7, 812.7, 812.7),  # 10:00
+    (36900, 803.5, 803.3, 803.3, 803.5),  # 10:15
+    (37800, 801.4, 801.1, 801.1, 801.4),  # 10:30
+    (38700, 840.9, 840.8, 840.8, 840.9),  # 10:45
+    (39600, 816.8, 816.7, 816.7, 816.8),  # 11:00
+    (40500, 832.2, 832.0, 832.0, 832.2),  # 11:15
+    (41400, 847.9, 847.7, 847.7, 847.9),  # 11:30
+    (42300, 845.2, 845.0, 845.0, 845.1),  # 11:45
+    (43200, 853.5, 853.2, 853.2, 853.4),  # 12:00
+    (44100, 870.2, 870.0, 870.0, 870.1),  # 12:15
+    (45000, 889.1, 889.0, 889.0, 889.1),  # 12:30
+    (45900, 885.6, 885.6, 885.6, 885.6),  # 12:45
+    (46800, 867.8, 867.6, 867.6, 867.6),  # 13:00
+    (47700, 888.7, 888.5, 888.5, 888.5),  # 13:15
+    (48600, 907.2, 906.9, 906.9, 907.2),  # 13:30
+    (49500, 904.6, 904.5, 904.5, 904.5),  # 13:45
+    (50400, 899.6, 899.4, 899.4, 899.3),  # 14:00
+    (51300, 894.7, 894.4, 894.4, 894.6),  # 14:15
+    (52200, 894.9, 894.7, 894.7, 894.9),  # 14:30
+    (53100, 889.2, 889.0, 889.0, 889.2),  # 14:45
+    (54000, 874.8, 874.6, 874.6, 874.8),  # 15:00
+    (54900, 885.9, 885.7, 885.7, 885.9),  # 15:15
+    (55800, 874.7, 874.6, 874.6, 874.5),  # 15:30
+    (56700, 882.6, 882.3, 882.3, 882.4),  # 15:45
+    (57600, 872.8, 872.7, 872.7, 872.8),  # 16:00
+    (58500, 859.8, 859.7, 859.7, 859.8),  # 16:15
+    (59400, 883.3, 883.2, 883.2, 883.1),  # 16:30
+    (60300, 893.6, 893.3, 893.3, 893.3),  # 16:45
+    (61200, 897.9, 897.8, 897.8, 897.8),  # 17:00
+    (62100, 908.0, 907.9, 907.9, 907.9),  # 17:15  ← PM peak
+    (63000, 906.8, 906.7, 906.7, 906.7),  # 17:30
+    (63900, 876.3, 876.0, 876.0, 876.2),  # 17:45
+    (64800, 814.3, 813.8, 813.8, 814.0),  # 18:00
+    (65700, 776.0, 775.2, 775.2, 775.7),  # 18:15
+    (66600, 713.6, 712.9, 712.9, 713.4),  # 18:30
+    (67500, 664.6, 664.0, 664.0, 664.5),  # 18:45
+    (68400, 630.4, 629.9, 629.9, 630.1),  # 19:00
+    (69300, 613.2, 612.8, 612.8, 613.1),  # 19:15
+    (70200, 567.3, 566.6, 566.6, 566.9),  # 19:30
+    (71100, 528.7, 528.2, 528.2, 528.5),  # 19:45
+    (72000, 476.3, 475.9, 475.9, 476.1),  # 20:00
+    (72900, 435.4, 434.6, 434.6, 435.2),  # 20:15
+    (73800, 404.0, 403.3, 403.3, 403.7),  # 20:30
+    (74700, 364.4, 363.7, 363.7, 363.8),  # 20:45
+    (75600, 337.0, 336.5, 336.5, 336.6),  # 21:00
+    (76500, 303.5, 302.7, 302.7, 303.3),  # 21:15
+    (77400, 288.3, 287.7, 287.7, 287.7),  # 21:30
+    (78300, 257.4, 256.3, 256.3, 256.7),  # 21:45
+    (79200, 239.6, 238.4, 238.4, 238.3),  # 22:00
+    (80100, 216.4, 214.9, 214.9, 215.6),  # 22:15
+    (81000, 183.9, 182.6, 182.6, 182.7),  # 22:30
+    (81900, 164.3, 162.6, 162.6, 163.5),  # 22:45
+    (82800, 148.5, 147.1, 147.1, 147.4),  # 23:00
+    (83700, 136.5, 135.0, 135.0, 135.5),  # 23:15
+    (84600, 111.3, 109.7, 109.7, 110.1),  # 23:30
+    (85500,  97.8,  96.2,  96.2,  96.7),  # 23:45
+]
 
-def cleanup_hardware(GPIO, lcd):
-    if lcd:
-        try: lcd.clear()
-        except: pass
-    if GPIO:
-        try: GPIO.cleanup()
-        except: pass
+# ═══════════════════════════════════════════════════════════════════════════════
+# TLS PHASE DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase → which arms get green (fraction of their queue drained per step)
+#   Phase 0: D straight           → drains D
+#   Phase 2: A straight + B left  → drains A fully, B partially
+#   Phase 4: B straight + C left  → drains B partially, C partially
+#   Phase 6: C straight + D right → drains C fully, D partially
+PHASE_GREEN = [0, 2, 4, 6]
+PHASE_LABEL = {0: "Ph0 D ", 2: "Ph2 AB", 4: "Ph4 BC", 6: "Ph6 CD"}
 
-# =============================================================================
-#  LED FUNCTIONS  — take GPIO as parameter (no global state)
-# =============================================================================
-RED_S=0; GREEN_S=1; AMBER_S=2
-
-def rgb_set(GPIO, r, g, b):
-    if not GPIO: return
-    GPIO.output(27, GPIO.LOW  if r else GPIO.HIGH)
-    GPIO.output(22, GPIO.LOW  if g else GPIO.HIGH)
-    GPIO.output(23, GPIO.LOW  if b else GPIO.HIGH)
-
-def cat_set(GPIO, r_pin, g_pin, a_pin, state):
-    if not GPIO: return
-    GPIO.output(r_pin, GPIO.HIGH if state==RED_S   else GPIO.LOW)
-    GPIO.output(g_pin, GPIO.HIGH if state==GREEN_S else GPIO.LOW)
-    GPIO.output(a_pin, GPIO.HIGH if state==AMBER_S else GPIO.LOW)
-
-def apply_leds(GPIO, tls_phase):
-    """Drive all LEDs for the given TLS green phase (0,2,4,6)."""
-    if not GPIO: return
-    states = {
-        0: [('rgb','red'),  ('D2',GREEN_S),('D1',RED_S),  ('B1',RED_S),  ('B2',RED_S),  ('C1',RED_S)],
-        2: [('rgb','green'),('D2',RED_S),  ('D1',RED_S),  ('B1',GREEN_S),('B2',RED_S),  ('C1',RED_S)],
-        4: [('rgb','red'),  ('D2',RED_S),  ('D1',RED_S),  ('B1',RED_S),  ('B2',GREEN_S),('C1',RED_S)],
-        6: [('rgb','red'),  ('D2',RED_S),  ('D1',GREEN_S),('B1',RED_S),  ('B2',RED_S),  ('C1',GREEN_S)],
-    }
-    PIN_MAP = {
-        'D2':(19,26,21), 'D1':(5,6,13),
-        'B1':(20,16,12), 'B2':(8,25,24), 'C1':(7,9,11),
-    }
-    for item in states.get(tls_phase, []):
-        if item[0] == 'rgb':
-            if item[1]=='red':   rgb_set(GPIO,1,0,0)
-            elif item[1]=='green': rgb_set(GPIO,0,1,0)
-            elif item[1]=='amber': rgb_set(GPIO,1,1,0)
-        else:
-            r,g,a = PIN_MAP[item[0]]
-            cat_set(GPIO,r,g,a,item[1])
-
-def all_off(GPIO):
-    if not GPIO: return
-    rgb_set(GPIO,0,0,0)
-    for pins in [(19,26,21),(5,6,13),(20,16,12),(8,25,24),(7,9,11)]:
-        for p in pins: GPIO.output(p, GPIO.LOW)
-    GPIO.output(17, GPIO.LOW)
-
-def show_lcd(lcd, line1, line2=""):
-    if not lcd: return
-    try:
-        lcd.clear()
-        time.sleep(0.05)
-        lcd.cursor_pos = (0,0)
-        lcd.write_string(line1[:16])
-        if line2:
-            lcd.cursor_pos = (1,0)
-            lcd.write_string(line2[:16])
-    except: pass
-
-def blink_boot(GPIO, times=3):
-    if not GPIO: return
-    for _ in range(times):
-        GPIO.output(17, GPIO.HIGH); time.sleep(0.4)
-        GPIO.output(17, GPIO.LOW);  time.sleep(0.4)
-
-# =============================================================================
-#  AVID DATA LOADER
-# =============================================================================
-def load_avid(csv_path, begin_s=0):
-    rows = []
-    with open(csv_path, encoding='utf-8') as f:
-        for row in csv.DictReader(f):
-            slot  = int(float(row['time_slot']))
-            hour  = int(float(row['hour']))
-            sim_t = slot * 900
-            if sim_t < begin_s:
-                continue
-            e = float(row['E_approach'])
-            n = float(row['N_approach'])
-            s = float(row['S_approach'])
-            a = (e + n + s) / 3.0
-            # 50% of 15-min arrivals estimated as queued
-            q_b = round(e * 0.5, 1)
-            q_d = round(n * 0.5, 1)
-            q_c = round(s * 0.5, 1)
-            q_a = round(a * 0.5, 1)
-            occ   = min((q_b+q_d+q_c+q_a)/80.0, 1.0)
-            speed = max(2.0, 13.89*(1-occ))
-            rows.append({
-                'slot': slot, 'hour': hour, 'sim_time': sim_t,
-                'hhmm': f"{hour:02d}:{(slot%4)*15:02d}",
-                'A': {'queue':q_a,'occ':occ*100,'speed':speed},
-                'B': {'queue':q_b,'occ':occ*100,'speed':speed},
-                'C': {'queue':q_c,'occ':occ*100,'speed':speed},
-                'D': {'queue':q_d,'occ':occ*100,'speed':speed},
-                'out1':{'queue':q_b*0.3}, 'out2':{'queue':q_a*0.3},
-                'out3':{'queue':q_c*0.3}, 'out4':{'queue':q_d*0.3},
-            })
-    return rows
-
-# =============================================================================
-#  MAX PRESSURE  (no switching loss — always picks best)
-# =============================================================================
-PHASES_CYCLE    = [0, 2, 4, 6]
-MIN_GREEN_STEPS = 1
-MAX_GREEN_STEPS = 4
-
-PHASE_MOVEMENTS = {
-    0: [("D","out2",0.25),("D","out2",0.25)],
-    2: [("B","out1",0.33),("B","out1",0.33),("A","out2",0.5),("A","out2",0.5)],
-    4: [("B","out4",0.33),("C","out2",0.33)],
-    6: [("D","out4",0.25),("D","out4",0.25),("C","out3",0.33),("C","out3",0.33)],
+# Drain coefficients: how much of each arm's queue is served per step
+PHASE_DRAIN = {
+    0: {"A": 0.0, "B": 0.0, "C": 0.0, "D": 1.0},
+    2: {"A": 1.0, "B": 0.5, "C": 0.0, "D": 0.0},
+    4: {"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0},
+    6: {"A": 0.0, "B": 0.0, "C": 1.0, "D": 0.5},
 }
 
-def compute_pressures(data):
-    return {
-        ph: round(sum(
-            max(0.0, data[a]['queue'] - f*data.get(ex,{'queue':0})['queue'])
-            for a,ex,f in mvs if a in data
-        ), 3)
-        for ph, mvs in PHASE_MOVEMENTS.items()
-    }
+# Max Pressure: pressure = sum of upstream queues served by this phase
+PHASE_UPSTREAM = {
+    0: ["D"],
+    2: ["A", "B"],
+    4: ["B", "C"],
+    6: ["C", "D"],
+}
 
-def mp_select(data, current, elapsed):
-    if elapsed < MIN_GREEN_STEPS:
-        return current
-    pressures = compute_pressures(data)
-    return max(pressures, key=pressures.get)
+FIXED_GREEN_S  = 30
+YELLOW_S       = 4
+MIN_GREEN_S    = 15
+MAX_GREEN_S    = 90
+SERVICE_RATE   = 1800  # veh/hr saturation flow per arm
 
-# =============================================================================
-#  DQN INFERENCE  (forward pass only, no training)
-# =============================================================================
-STATE_DIM  = 27
-ACTION_DIM = 4
-DQN_HIDDEN = [256,128,64]
-STARVATION_HARD    = 180
-DQN_CONF_THRESHOLD = 1.0
+# ═══════════════════════════════════════════════════════════════════════════════
+# GPIO PIN MAP  (all common-cathode, HIGH = ON)
+# ═══════════════════════════════════════════════════════════════════════════════
+PIN_MAP = {
+    # phase: (red_pin, green_pin, amber_pin)
+    0: (19, 26, 21),   # Arm D→out2
+    2: (20, 16, 12),   # Arm B→out1
+    4: ( 8, 25, 24),   # Arm B→out4
+    6: ( 7,  9, 11),   # Arm C→out3
+}
 
-def relu(x): return np.maximum(0.0, x)
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIGHTWEIGHT DQN AGENT  (inference only, numpy)
+# ═══════════════════════════════════════════════════════════════════════════════
+class DQNInference:
+    """Forward pass through trained 27→256→128→64→4 network."""
 
-class TinyDQN:
-    def __init__(self, path):
-        self.layers = []
-        self.loaded = False
-        try:
-            d = np.load(str(path))
-            i = 0
-            while f"W_{i}" in d:
-                self.layers.append((d[f"W_{i}"].astype(np.float32),
-                                    d[f"b_{i}"].astype(np.float32)))
-                i += 1
-            self.loaded = True
-            print("DQN weights loaded: " + str(len(self.layers)) + " layers")
-        except Exception as e:
-            print("DQN weights not found: " + str(e))
+    def __init__(self, weights_path):
+        data = np.load(weights_path)
+        self.W1 = data["W1"]
+        self.b1 = data["b1"]
+        self.W2 = data["W2"]
+        self.b2 = data["b2"]
+        self.W3 = data["W3"]
+        self.b3 = data["b3"]
+        self.W4 = data["W4"]
+        self.b4 = data["b4"]
+        print(f"DQN weights loaded: {weights_path}")
 
     def predict(self, state):
-        if not self.loaded:
-            return np.zeros(ACTION_DIM, dtype=np.float32)
-        x = state.astype(np.float32)
-        for i,(W,b) in enumerate(self.layers):
-            x = x @ W + b
-            if i < len(self.layers)-1:
-                x = relu(x)
-        return x
+        """Return Q-values for all 4 actions."""
+        x = np.array(state, dtype=np.float32)
+        x = np.maximum(0, self.W1 @ x + self.b1)   # ReLU
+        x = np.maximum(0, self.W2 @ x + self.b2)
+        x = np.maximum(0, self.W3 @ x + self.b3)
+        q = self.W4 @ x + self.b4
+        return q
 
-def build_state(data, phase, elapsed, sim_time, waits):
-    arms = ["A","B","C","D"]
-    outs = ["out1","out2","out3","out4"]
-    q   = [data[a]['queue']/50.0       for a in arms]
-    occ = [min(data[a]['occ']/100,1)   for a in arms]
-    spd = [max(data[a]['speed'],0)/15  for a in arms]
-    ds  = [data.get(o,{'queue':0})['queue']/50 for o in outs]
-    ph_oh = [1.0 if PHASES_CYCLE[i]==phase else 0.0 for i in range(4)]
-    el    = min(elapsed/MAX_GREEN_STEPS, 1.0)
-    hour  = (sim_time//3600)%24
-    sin_h = math.sin(2*math.pi*hour/24)
-    cos_h = math.cos(2*math.pi*hour/24)
-    wait_arr = [min(waits.get(ph,0)/STARVATION_HARD,2.0) for ph in PHASES_CYCLE]
-    state = np.array(q+occ+spd+ds+ph_oh+[el,sin_h,cos_h]+wait_arr,
-                     dtype=np.float32)
-    return state
+    def act(self, state):
+        """Greedy action selection."""
+        q = self.predict(state)
+        return int(np.argmax(q))
 
-# =============================================================================
-#  PHASE MANAGER
-# =============================================================================
-class PhaseManager:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUEUE SIMULATOR
+# ═══════════════════════════════════════════════════════════════════════════════
+class QueueSim:
+    """Simulates queue build-up and drain per arm using demand profile."""
+
     def __init__(self):
-        self.current = PHASES_CYCLE[0]
-        self.elapsed = 0
-        self.waits   = {ph:0 for ph in PHASES_CYCLE}
+        self.queues = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        self.wait   = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        self.demand_idx = 0
 
-    def step(self, requested):
-        for ph in PHASES_CYCLE:
-            if ph != self.current:
-                self.waits[ph] += 1
-        want  = (requested != self.current and self.elapsed >= MIN_GREEN_STEPS)
-        force = (self.elapsed >= MAX_GREEN_STEPS)
-        if want or force:
-            if force and not want:
-                idx = PHASES_CYCLE.index(self.current)
-                requested = PHASES_CYCLE[(idx+1)%4]
-            self.current = requested
-            self.elapsed = 0
-            self.waits[self.current] = 0
-            return True
-        else:
-            self.elapsed += 1
-            return False
+    def get_demand(self, sim_time):
+        """Look up vph per arm for current sim_time."""
+        idx = min(int(sim_time // 900), len(DEMAND) - 1)
+        _, a, b, c, d = DEMAND[idx]
+        return {"A": a, "B": b, "C": c, "D": d}
 
-# =============================================================================
-#  MAIN RUN FUNCTION
-# =============================================================================
-PHASE_LABELS = {0:"Ph0 D  36s",2:"Ph2 AB 25s",4:"Ph4 BC 20s",6:"Ph6 CD 36s"}
+    def step(self, phase, green_s, sim_time):
+        """Advance one green interval: arrivals accumulate, active phase drains."""
+        demand = self.get_demand(sim_time)
+        drain  = PHASE_DRAIN[phase]
 
-def run(mode='hybrid_drl', speed=30, csv_path=None, begin_s=0,
-        no_hardware=False, metrics_path=None):
-    """
-    Main simulation loop. Called directly or from rpi_dashboard threads.
-    Each parameter is explicit — no global state.
-    """
-    import json
+        for arm in ["A", "B", "C", "D"]:
+            arrivals = demand[arm] * (green_s / 3600.0)
+            served   = drain[arm] * SERVICE_RATE * (green_s / 3600.0)
+            self.queues[arm] = max(0.0, self.queues[arm] + arrivals - served)
+            if drain[arm] > 0:
+                self.wait[arm] = max(0.0, self.wait[arm] - green_s)
+            else:
+                self.wait[arm] += green_s
 
-    if csv_path is None:
-        csv_path = str(HERE/'j1_demand_15min.csv')
+    def total_queue(self):
+        return sum(self.queues.values())
 
-    # Hardware setup — each call gets its own GPIO/LCD handle
-    GPIO, lcd = setup_hardware(not no_hardware)
+    def build_state(self, current_phase_idx, sim_time):
+        """Build 27-dim state vector matching DQN training format."""
+        demand = self.get_demand(sim_time)
+        hour = (sim_time % 86400) / 86400.0
 
-    # Metrics output
-    out_dir = HERE/'output'
-    out_dir.mkdir(exist_ok=True)
-    if metrics_path is None:
-        metrics_path = out_dir/('j1_v2_metrics_'+mode+'.json')
-    metrics_path = Path(metrics_path)
-    if metrics_path.exists():
-        metrics_path.unlink()
-    records = []
+        state = []
+        for arm in ["A", "B", "C", "D"]:
+            state.append(self.queues[arm] / 50.0)       # normalised queue
+            state.append(self.wait[arm] / 120.0)         # normalised wait
+            state.append(demand[arm] / 1000.0)           # normalised demand
+        # one-hot current phase
+        for i in range(4):
+            state.append(1.0 if i == current_phase_idx else 0.0)
+        # pressure per phase
+        for ph in PHASE_GREEN:
+            p = sum(self.queues[a] for a in PHASE_UPSTREAM[ph])
+            state.append(p / 100.0)
+        # time features
+        state.append(hour)
+        state.append(math.sin(2 * math.pi * hour))
+        state.append(math.cos(2 * math.pi * hour))
+        # equity: max wait
+        state.append(max(self.wait.values()) / 120.0)
+        # total queue
+        state.append(self.total_queue() / 200.0)
+        # demand imbalance
+        vals = list(demand.values())
+        state.append((max(vals) - min(vals)) / 500.0)
+        return state  # length 27
 
-    print("=== J1 " + mode.upper() + " | speed=" + str(speed) + "x ===")
 
-    rows = load_avid(csv_path, begin_s)
-    if not rows:
-        print("No data — check CSV path"); cleanup_hardware(GPIO,lcd); return
+# ═══════════════════════════════════════════════════════════════════════════════
+# HARDWARE INTERFACE
+# ═══════════════════════════════════════════════════════════════════════════════
+class HardwareIO:
+    """Drives 4 signal-head LEDs + LCD.  Falls back to console."""
 
-    # Load DQN if needed
+    def __init__(self, skip_hw=False):
+        self.gpio = None
+        self.lcd  = None
+
+        if skip_hw:
+            print("[HW] Console-only mode (--no-hardware)")
+            return
+
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
+            for phase, (r, g, y) in PIN_MAP.items():
+                for pin in (r, g, y):
+                    GPIO.setup(pin, GPIO.OUT)
+                    GPIO.output(pin, GPIO.LOW)
+            self.gpio = GPIO
+            print("[HW] GPIO initialised — 12 LED pins ready")
+        except Exception as e:
+            print(f"[HW] No GPIO ({e})")
+
+        try:
+            from RPLCD.i2c import CharLCD
+            self.lcd = CharLCD("PCF8574", 0x27, port=1, cols=16, rows=2)
+            self.lcd.clear()
+            print("[HW] LCD connected at 0x27")
+        except Exception as e:
+            print(f"[HW] No LCD ({e})")
+
+    def set_signal(self, active_phase, state="green"):
+        """Set LEDs: active_phase gets green/amber, all others red."""
+        if self.gpio is None:
+            return
+        for phase, (r, g, y) in PIN_MAP.items():
+            if phase == active_phase:
+                if state == "green":
+                    self.gpio.output(r, self.gpio.LOW)
+                    self.gpio.output(g, self.gpio.HIGH)
+                    self.gpio.output(y, self.gpio.LOW)
+                elif state == "amber":
+                    self.gpio.output(r, self.gpio.LOW)
+                    self.gpio.output(g, self.gpio.LOW)
+                    self.gpio.output(y, self.gpio.HIGH)
+                else:  # red
+                    self.gpio.output(r, self.gpio.HIGH)
+                    self.gpio.output(g, self.gpio.LOW)
+                    self.gpio.output(y, self.gpio.LOW)
+            else:
+                # all non-active phases show red
+                self.gpio.output(r, self.gpio.HIGH)
+                self.gpio.output(g, self.gpio.LOW)
+                self.gpio.output(y, self.gpio.LOW)
+
+    def all_red(self):
+        """All signals red (clearance)."""
+        if self.gpio is None:
+            return
+        for phase, (r, g, y) in PIN_MAP.items():
+            self.gpio.output(r, self.gpio.HIGH)
+            self.gpio.output(g, self.gpio.LOW)
+            self.gpio.output(y, self.gpio.LOW)
+
+    def show_lcd(self, line1, line2=""):
+        if self.lcd:
+            try:
+                self.lcd.clear()
+                self.lcd.write_string(line1[:16])
+                if line2:
+                    self.lcd.crlf()
+                    self.lcd.write_string(line2[:16])
+            except:
+                pass
+        # always echo to console
+        print(f"  LCD| {line1:<16s} | {line2:<16s}")
+
+    def cleanup(self):
+        if self.gpio:
+            self.all_red()
+            self.gpio.cleanup()
+        if self.lcd:
+            try:
+                self.lcd.clear()
+                self.lcd.write_string("Demo stopped")
+            except:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTROLLER LOGIC
+# ═══════════════════════════════════════════════════════════════════════════════
+def pick_phase_fixed(cycle_idx):
+    return PHASE_GREEN[cycle_idx % 4]
+
+
+def pick_phase_mp(sim, sim_time):
+    """Max Pressure: pick phase with highest upstream queue pressure."""
+    best_ph = 0
+    best_p  = -1
+    for ph in PHASE_GREEN:
+        pressure = sum(sim.queues[a] for a in PHASE_UPSTREAM[ph])
+        if pressure > best_p:
+            best_p  = pressure
+            best_ph = ph
+    return best_ph
+
+
+def pick_phase_drl(sim, dqn, current_phase_idx, sim_time):
+    """Hybrid DQN: uses trained network to select best phase."""
+    state  = sim.build_state(current_phase_idx, sim_time)
+    action = dqn.act(state)
+    return PHASE_GREEN[action]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+def run(mode, speed, no_hw):
+    hw  = HardwareIO(skip_hw=no_hw)
+    sim = QueueSim()
+
     dqn = None
-    if mode == 'hybrid_drl':
-        dqn = TinyDQN(HERE/'j1_dqn_weights.npz')
-        if not dqn.loaded:
-            print("WARNING: no weights — falling back to MP")
-            mode = 'mp'
+    if mode == "hybrid_drl":
+        wpath = HERE / "j1_dqn_weights.npz"
+        if wpath.exists():
+            dqn = DQNInference(str(wpath))
+        else:
+            print(f"[WARN] {wpath} not found — falling back to MP")
+            mode = "mp"
 
-    ph        = PhaseManager()
-    step_secs = 900.0 / speed
-    total_q   = 0
+    hw.show_lcd("J1 Gaborone", f"Mode: {mode[:10]}")
+    time.sleep(2.0 / speed)
 
-    # Boot sequence (hardware only)
-    if GPIO:
-        blink_boot(GPIO, 3)
-        show_lcd(lcd, "J1 Gaborone", mode.upper()+" mode")
-        time.sleep(1)
+    sim_time    = 0         # seconds into day
+    cycle_idx   = 0
+    phase_idx   = 0         # index into PHASE_GREEN
+    total_q_sum = 0.0
+    n_steps     = 0
+    switches    = 0
+
+    print(f"\n{'='*60}")
+    print(f"  J1 ADAPTIVE SIGNAL DEMO — {mode.upper()}")
+    print(f"  Speed: {speed}×  |  96 intervals (24 h)")
+    print(f"{'='*60}\n")
 
     try:
-        for i, row in enumerate(rows):
-            sim_time = row['sim_time']
-            hhmm     = row['hhmm']
-            data     = row
-
-            # ── Phase decision ────────────────────────────────────────────────
-            if mode == 'fixed':
-                requested = PHASES_CYCLE[(i//3)%4]
-
-            elif mode == 'mp':
-                requested = mp_select(data, ph.current, ph.elapsed)
-
-            elif mode == 'hybrid_drl':
-                mp_phase = mp_select(data, ph.current, ph.elapsed)
-                state    = build_state(data, ph.current, ph.elapsed,
-                                       sim_time, ph.waits)
-                q_vals      = dqn.predict(state)
-                drl_idx     = int(np.argmax(q_vals))
-                drl_phase   = PHASES_CYCLE[drl_idx]
-                sorted_q    = np.sort(q_vals)[::-1]
-                confidence  = float(sorted_q[0]-sorted_q[1])
-                requested   = drl_phase if (confidence>=DQN_CONF_THRESHOLD
-                              and ph.elapsed>=MIN_GREEN_STEPS) else mp_phase
+        while sim_time < 86400:
+            # ── decide phase ──────────────────────────────────────────
+            if mode == "fixed":
+                phase = pick_phase_fixed(cycle_idx)
+                green_s = FIXED_GREEN_S
+            elif mode == "mp":
+                phase = pick_phase_mp(sim, sim_time)
+                green_s = FIXED_GREEN_S
             else:
-                requested = ph.current
+                phase = pick_phase_drl(sim, dqn, phase_idx, sim_time)
+                green_s = FIXED_GREEN_S
 
-            switched = ph.step(requested)
+            new_idx = PHASE_GREEN.index(phase)
+            if new_idx != phase_idx:
+                switches += 1
 
-            # ── Hardware output ───────────────────────────────────────────────
-            apply_leds(GPIO, ph.current)
-            qA=data['A']['queue']; qB=data['B']['queue']
-            qC=data['C']['queue']; qD=data['D']['queue']
-            label = PHASE_LABELS.get(ph.current,"Ph?")
-            show_lcd(lcd, hhmm+" "+label[:8],
-                     "A"+str(int(qA))+"B"+str(int(qB))+
-                     "C"+str(int(qC))+"D"+str(int(qD)))
+                # ── yellow transition ─────────────────────────────────
+                hw.set_signal(PHASE_GREEN[phase_idx], "amber")
+                h = sim_time // 3600
+                m = (sim_time % 3600) // 60
+                hw.show_lcd(f"{h:02d}:{m:02d} YELLOW",
+                            f"{PHASE_LABEL[PHASE_GREEN[phase_idx]]}")
+                time.sleep(YELLOW_S / speed)
 
-            # ── Metrics ───────────────────────────────────────────────────────
-            records.append({
-                't':sim_time,'hhmm':hhmm,'phase':ph.current,
-                'sw':int(switched),
-                'q_A':round(qA,1),'q_B':round(qB,1),
-                'q_C':round(qC,1),'q_D':round(qD,1),
-                'occ_A':round(data['A']['occ'],1),
-                'occ_B':round(data['B']['occ'],1),
-                'occ_C':round(data['C']['occ'],1),
-                'occ_D':round(data['D']['occ'],1),
-                'spd_A':round(data['A']['speed'],2),
-                'spd_B':round(data['B']['speed'],2),
-                'spd_C':round(data['C']['speed'],2),
-                'spd_D':round(data['D']['speed'],2),
-                'reward':0.0,
-            })
-            # Flush every step so dashboard updates immediately
-            with open(metrics_path,'w') as mf:
-                json.dump(records, mf)
+                # ── all-red clearance ─────────────────────────────────
+                hw.all_red()
+                time.sleep(1.0 / speed)
 
-            q_now = qA+qB+qC+qD
-            total_q += q_now
-            print(hhmm+" Ph"+str(ph.current)+
-                  " A="+str(int(qA))+" B="+str(int(qB))+
-                  " C="+str(int(qC))+" D="+str(int(qD))+
-                  " Q="+str(int(q_now))+
-                  (" [SW]" if switched else ""))
+            phase_idx = new_idx
 
-            time.sleep(step_secs)
+            # ── green phase ───────────────────────────────────────────
+            hw.set_signal(phase, "green")
+
+            h = sim_time // 3600
+            m = (sim_time % 3600) // 60
+            q = sim.total_queue()
+            total_q_sum += q
+            n_steps += 1
+
+            hw.show_lcd(
+                f"{h:02d}:{m:02d} {PHASE_LABEL[phase]}",
+                f"Q:{q:4.0f} {mode[:3]:>3s}"
+            )
+
+            demand = sim.get_demand(sim_time)
+            print(f"  {h:02d}:{m:02d}  {PHASE_LABEL[phase]}  "
+                  f"Q=[A:{sim.queues['A']:5.1f} B:{sim.queues['B']:5.1f} "
+                  f"C:{sim.queues['C']:5.1f} D:{sim.queues['D']:5.1f}]  "
+                  f"tot={q:6.1f}  dem={sum(demand.values()):6.0f}")
+
+            # ── simulate queue dynamics ───────────────────────────────
+            sim.step(phase, green_s, sim_time)
+
+            # ── advance time ──────────────────────────────────────────
+            time.sleep(green_s / speed)
+            sim_time += green_s
+            cycle_idx += 1
 
     except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        n = max(len(records),1)
-        print("=== Done | avg Q="+str(round(total_q/n,1))+" | steps="+str(n)+" ===")
-        with open(metrics_path,'w') as mf:
-            json.dump(records, mf)
-        show_lcd(lcd,"Done "+mode[:6],
-                 "Q:"+str(round(total_q/n,1)))
-        time.sleep(2)
-        all_off(GPIO)
-        cleanup_hardware(GPIO, lcd)
+        print("\n[STOP] Ctrl+C")
 
-# =============================================================================
-#  ENTRY POINT
-# =============================================================================
-if __name__ == '__main__':
-    p = argparse.ArgumentParser()
-    p.add_argument('--mode',        default='hybrid_drl',
-                   choices=['fixed','mp','hybrid_drl'])
-    p.add_argument('--speed',       default=30, type=float)
-    p.add_argument('--begin',       default=0,  type=int)
-    p.add_argument('--csv',         default=str(HERE/'j1_demand_15min.csv'))
-    p.add_argument('--no-hardware', action='store_true')
+    # ── summary ───────────────────────────────────────────────────────────
+    avg_q = total_q_sum / max(n_steps, 1)
+    print(f"\n{'='*60}")
+    print(f"  {mode.upper()} COMPLETE")
+    print(f"  Steps: {n_steps}  |  Switches: {switches}")
+    print(f"  Avg queue: {avg_q:.1f} veh")
+    print(f"{'='*60}")
+
+    hw.show_lcd(f"Done {mode[:6]}", f"AvgQ:{avg_q:.1f}")
+    time.sleep(3.0)
+    hw.cleanup()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="J1 Adaptive Traffic Signal Demo")
+    p.add_argument("--mode", default="hybrid_drl",
+                   choices=["fixed", "mp", "hybrid_drl"])
+    p.add_argument("--speed", type=float, default=10,
+                   help="Playback multiplier (10 = fast demo)")
+    p.add_argument("--no-hardware", action="store_true",
+                   help="Run without GPIO/LCD (laptop test)")
     args = p.parse_args()
-    run(args.mode, args.speed, args.csv, args.begin, args.no_hardware)
+    run(args.mode, args.speed, args.no_hardware)
