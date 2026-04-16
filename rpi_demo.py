@@ -52,6 +52,11 @@ SERVICE_RATE = 2200    # calibrated to match SUMO queue scale
 QUEUE_DECAY  = 0.985   # natural dissipation (vehicles reroute/leave)
 EQUITY_MAX   = 90      # force phase after 90s without green
 
+# ─── SUMO simulation window (matches j1_v2_traci_controller.py) ───
+SIM_BEGIN = 21600   # 06:00 — seconds since midnight
+SIM_END   = 32400   # 09:00 — seconds since midnight
+SIM_SECONDS = SIM_END - SIM_BEGIN   # 10800 = 3 hours
+
 # ═══════════════════════════════════════════════════════════════
 # GPIO — matches blinkv1.py exactly
 # ═══════════════════════════════════════════════════════════════
@@ -235,10 +240,11 @@ def run(mode, speed, no_hw):
             try: dqn=DQNInference(str(wp))
             except Exception as e: print(f"[WARN] DQN failed ({e})")
         if not dqn: print("[INFO] Using equity-weighted heuristic for DRL")
-    sim_t=0;ci=0;pi=0;tot_q=0;ns=0;sw=0
-    print(f"\n{'='*60}\n  J1 SIGNAL — {mode.upper()} (equity forcing ON)\n{'='*60}\n")
+    sim_t=SIM_BEGIN;ci=0;pi=0;tot_q=0;ns=0;sw=0
+    print(f"\n{'='*60}\n  J1 SIGNAL — {mode.upper()} (equity forcing ON)")
+    print(f"  Window: 06:00–09:00 (3 hours, matches SUMO)\n{'='*60}\n")
     try:
-        while sim_t<86400:
+        while sim_t<SIM_END:
             if mode=="fixed": ph=pick_fixed(ci)
             elif mode=="mp": ph=pick_mp(sim)
             else: ph=pick_drl(sim,dqn,pi,sim_t)

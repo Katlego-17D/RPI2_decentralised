@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from rpi_demo import (AVID_HOURLY,get_demand,PHASE_GREEN,PHASE_LABEL,PHASE_DRAIN,
     PHASE_UPSTREAM,GREEN_S,YELLOW_S,SERVICE_RATE,QUEUE_DECAY,EQUITY_MAX,
+    SIM_BEGIN,SIM_END,SIM_SECONDS,
     QueueSim,DQNInference,HardwareIO,pick_fixed,pick_mp,pick_drl)
 HERE=Path(__file__).parent
 from flask import Flask,jsonify
@@ -25,8 +26,8 @@ def run_mode(mode,speed,hw=None):
             try: dqn=DQNInference(str(wp))
             except: pass
     with LOCK: STATE[mode]['running']=True; STATE[mode]['records']=[]
-    sim_t=0;ci=0;pi=0;sw_n=0
-    while sim_t<86400:
+    sim_t=SIM_BEGIN;ci=0;pi=0;sw_n=0
+    while sim_t<SIM_END:
         if mode=='fixed': ph=pick_fixed(ci)
         elif mode=='mp': ph=pick_mp(sim)
         else: ph=pick_drl(sim,dqn,pi,sim_t)
@@ -112,7 +113,7 @@ h1{font-size:20px;font-weight:600;letter-spacing:-.3px}
 </style></head><body>
 <div class="pg">
 <div class="hdr"><h1>J1 A1 Western Bypass / Airport Road, Gaborone</h1><span class="badge">RPi Live</span></div>
-<div class="sub">Raspberry Pi 2 · Density-aware signal controller · Max Pressure + DQN · AVID Oct 2025 · N=17,856 records</div>
+<div class="sub">Raspberry Pi 2 · AM Peak 06:00–09:00 · Max Pressure + DQN · AVID Oct 2025 · N=17,856 records</div>
 <div class="cards">
 <div class="card"><div class="card-lbl">Max Pressure avg queue</div><div class="card-val" id="k1">– <sub>veh</sub></div><div class="card-sub" id="k1s">waiting...</div></div>
 <div class="card"><div class="card-lbl">MP + DRL avg queue</div><div class="card-val" id="k2">– <sub>veh</sub></div><div class="card-sub" id="k2s">waiting...</div></div>
@@ -133,12 +134,12 @@ h1{font-size:20px;font-weight:600;letter-spacing:-.3px}
 <div class="clr"><div class="dot dot-w" id="ldot"></div><span id="ltxt">Waiting...</span></div>
 </div>
 <canvas id="cQ" style="max-height:300px"></canvas>
-<div class="fn" id="qfn">24h simulation · 30s steps · total vehicles queued at J1</div>
+<div class="fn" id="qfn">AM peak 06:00–09:00 · 30s steps · total vehicles queued at J1</div>
 </div>
 <div class="panel panel-hidden" id="tab-perf">
 <canvas id="cP" style="max-height:200px"></canvas>
 <table class="ptable"><thead><tr><th>Controller</th><th>Mean queue</th><th>Std dev</th><th>Max queue</th><th>Switches/hr</th></tr></thead><tbody id="ptb"></tbody></table>
-<div class="fn">Live evaluation · 24h · equity forcing (max wait 90s) · service rate 2200 veh/hr</div>
+<div class="fn">Live evaluation · AM peak 06:00–09:00 · equity forcing (max wait 90s) · service rate 2200 veh/hr</div>
 </div>
 <div class="panel panel-hidden" id="tab-training">
 <div class="cleg">
