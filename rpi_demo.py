@@ -2,6 +2,16 @@
 """
 rpi_demo.py — Adaptive Traffic Signal Demo on Raspberry Pi 2
 Real AVID demand (asymmetric E/N/S) · Equity forcing · 6 signal groups
+
+State vector matches j1_v2_drl.py training (27 features):
+  [0-3]   queue per arm A,B,C,D ÷ 50
+  [4-7]   occupancy per arm A,B,C,D (0-1)
+  [8-11]  speed per arm A,B,C,D ÷ 15
+  [12-15] downstream queue out1..out4 ÷ 50
+  [16-19] current phase one-hot
+  [20]    elapsed-in-phase ÷ 90
+  [21-22] sin/cos of hour
+  [23-26] starvation wait per phase ÷ 180
 """
 import time, argparse, math, sys
 from pathlib import Path
@@ -10,7 +20,6 @@ HERE = Path(__file__).parent
 
 # ═══════════════════════════════════════════════════════════════
 # AVID DEMAND — real per-camera hourly data (Oct 2025, 31 days)
-# (hour): (AVID_E_vph, AVID_N_vph, AVID_S_vph)
 # ═══════════════════════════════════════════════════════════════
 AVID_HOURLY = {
      0:( 64.1, 95.2, 67.4),  1:( 42.4, 64.0, 47.1),
@@ -46,16 +55,30 @@ PHASE_DRAIN = {
 }
 PHASE_UPSTREAM = {0:["D"], 2:["A","B"], 4:["B","C"], 6:["C","D"]}
 
+# ─── Downstream mapping (from j1_v2_drl.py: drain dict gives feeders) ───
+# out1 ← B (B→out1 = phase 2)   - Arm B feeds out1
+# out2 ← D (D→out2 = phase 0)   - Arm D feeds out2
+# out3 ← C (C→out3 = phase 6)   - Arm C feeds out3
+# out4 ← B+C+D (mixed in phases 4,6) — use mean
+PHASE_DOWNSTREAM = {0:"out2", 2:"out1", 4:"out4", 6:"out3"}
+
 GREEN_S      = 30
 YELLOW_S     = 4
 SERVICE_RATE = 2200    # calibrated to match SUMO queue scale
-QUEUE_DECAY  = 0.985   # natural dissipation (vehicles reroute/leave)
-EQUITY_MAX   = 90      # force phase after 90s without green
+QUEUE_DECAY  = 0.985   # natural dissipation
+EQUITY_MAX   = 90      # force phase after 90s without green (tight RPi value)
+
+# Training-time normalization constants (must match j1_v2_drl.py)
+QUEUE_NORM       = 50.0
+SPEED_NORM       = 15.0       # m/s ≈ 54 km/h
+MAX_GREEN_NORM   = 90.0       # for elapsed normalization
+STARVATION_HARD  = 180.0      # for wait normalization
+FREE_FLOW_SPEED  = 13.9       # m/s (~50 km/h, urban arterial)
 
 # ─── SUMO simulation window (matches j1_v2_traci_controller.py) ───
-SIM_BEGIN = 21600   # 06:00 — seconds since midnight
-SIM_END   = 32400   # 09:00 — seconds since midnight
-SIM_SECONDS = SIM_END - SIM_BEGIN   # 10800 = 3 hours
+SIM_BEGIN = 21600   # 06:00
+SIM_END   = 32400   # 09:00
+SIM_SECONDS = SIM_END - SIM_BEGIN
 
 # ═══════════════════════════════════════════════════════════════
 # GPIO — matches blinkv1.py exactly
@@ -74,62 +97,131 @@ PHASE_SIGNALS = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# DQN INFERENCE — auto-detects weight keys
+# DQN INFERENCE — supports multiple weight key formats
 # ═══════════════════════════════════════════════════════════════
 class DQNInference:
     def __init__(self, path):
         data = np.load(path); keys = sorted(data.files)
         print(f"DQN loaded: {keys}")
-        if "W1" in keys:
-            self.L=[(data[f"W{i}"],data[f"b{i}"]) for i in range(1,5)]
+        # Pattern A: W_0/b_0, W_1/b_1, ... (zero-indexed underscore — current trained weights)
+        if "W_0" in keys:
+            n = sum(1 for k in keys if k.startswith("W_"))
+            self.L = [(data[f"W_{i}"], data[f"b_{i}"]) for i in range(n)]
+        # Pattern B: W1/b1, W2/b2, ... (one-indexed no underscore)
+        elif "W1" in keys:
+            self.L = [(data[f"W{i}"], data[f"b{i}"]) for i in range(1, 5)]
+        # Pattern C: fc1.weight/fc1.bias (PyTorch state_dict)
         elif "fc1.weight" in keys:
-            self.L=[(data[f"fc{i}.weight"],data[f"fc{i}.bias"]) for i in range(1,5)]
+            self.L = [(data[f"fc{i}.weight"], data[f"fc{i}.bias"]) for i in range(1, 5)]
+        # Pattern D: arr_0, arr_1, ...
         else:
-            a=[data[k] for k in keys]; self.L=[]
-            for i in range(0,len(a),2):
-                W,b=a[i],a[i+1]
-                if W.ndim==1 and b.ndim==2: W,b=b,W
-                self.L.append((W,b))
-        for i,(W,b) in enumerate(self.L): print(f"  L{i}: {W.shape} {b.shape}")
+            a = [data[k] for k in keys
+                 if k.startswith(("arr_","W","b")) and not k.startswith(("state_","action_","hidden"))]
+            self.L = []
+            for i in range(0, len(a), 2):
+                W, b = a[i], a[i+1]
+                if W.ndim == 1 and b.ndim == 2: W, b = b, W
+                self.L.append((W, b))
+        for i, (W, b) in enumerate(self.L): print(f"  L{i}: W{W.shape} b{b.shape}")
 
     def act(self, state):
-        x=np.array(state,dtype=np.float32)
-        for i,(W,b) in enumerate(self.L):
-            x=W@x+b
-            if i<len(self.L)-1: x=np.maximum(0,x)
+        x = np.array(state, dtype=np.float32)
+        for i, (W, b) in enumerate(self.L):
+            # W stored as (in, out): use x @ W. Auto-detect transposed weights too.
+            if W.shape[0] == x.shape[0]:
+                x = x @ W + b
+            elif W.shape[1] == x.shape[0]:
+                x = W @ x + b
+            else:
+                raise ValueError(f"L{i}: cannot multiply x{x.shape} with W{W.shape}")
+            if i < len(self.L) - 1:
+                x = np.maximum(0, x)
         return int(np.argmax(x))
 
 # ═══════════════════════════════════════════════════════════════
-# QUEUE SIMULATOR
+# QUEUE SIMULATOR (with downstream tracking)
 # ═══════════════════════════════════════════════════════════════
 class QueueSim:
     def __init__(self):
-        self.queues = {a:0.0 for a in "ABCD"}
-        self.wait   = {a:0.0 for a in "ABCD"}
+        self.queues = {a: 0.0 for a in "ABCD"}
+        self.wait   = {a: 0.0 for a in "ABCD"}
+        # Downstream queues (proxy: vehicles recently sent to each out)
+        self.dq     = {o: 0.0 for o in ("out1","out2","out3","out4")}
+        # Per-phase wait (training-time semantics: time since this PHASE was served)
+        self.phase_wait = {ph: 0.0 for ph in PHASE_GREEN}
+        # Elapsed in current phase (for state[20])
+        self.elapsed = 0.0
+        self.last_phase = None
 
     def step(self, phase, sim_time):
         dem = get_demand(sim_time)
         drain = PHASE_DRAIN[phase]
+        # Service per arm
+        served_total = 0.0
         for arm in "ABCD":
             arr = dem[arm] * (GREEN_S / 3600.0)
-            srv = drain[arm] * SERVICE_RATE * (GREEN_S / 3600.0)
+            srv_cap = drain[arm] * SERVICE_RATE * (GREEN_S / 3600.0)
+            srv = min(srv_cap, self.queues[arm] + arr)
             self.queues[arm] = max(0.0, self.queues[arm] * QUEUE_DECAY + arr - srv)
             self.wait[arm] = 0 if drain[arm] > 0 else self.wait[arm] + GREEN_S
-
-    def total_queue(self): return sum(self.queues.values())
-
-    def build_state(self, phase_idx, sim_time):
-        dem = get_demand(sim_time); h = (sim_time % 86400) / 86400.0
-        s = []
-        for arm in "ABCD":
-            s += [self.queues[arm]/50, self.wait[arm]/120, dem[arm]/1000]
-        s += [1.0 if i==phase_idx else 0.0 for i in range(4)]
+            served_total += srv
+        # Update downstream proxy: served vehicles flow to corresponding out
+        ds = PHASE_DOWNSTREAM[phase]
+        for o in self.dq:
+            self.dq[o] *= QUEUE_DECAY  # all downstream queues drain
+        self.dq[ds] += served_total * 0.4   # ~40% accumulate locally
+        # Update per-phase service wait
         for ph in PHASE_GREEN:
-            s.append(sum(self.queues[a] for a in PHASE_UPSTREAM[ph])/100)
-        s += [h, math.sin(2*math.pi*h), math.cos(2*math.pi*h)]
-        s.append(max(self.wait.values())/120)
-        s.append(self.total_queue()/200)
-        v = list(dem.values()); s.append((max(v)-min(v))/500)
+            self.phase_wait[ph] = 0.0 if ph == phase else self.phase_wait[ph] + GREEN_S
+        # Track elapsed in same phase (for state[20])
+        if phase == self.last_phase:
+            self.elapsed += GREEN_S
+        else:
+            self.elapsed = GREEN_S
+            self.last_phase = phase
+
+    def total_queue(self):
+        return sum(self.queues.values())
+
+    def build_state(self, phase, sim_time):
+        """27-feature state vector matching j1_v2_drl.py training."""
+        ARMS = ["A","B","C","D"]
+        OUTS = ["out1","out2","out3","out4"]
+
+        # [0-3] queue per arm ÷ QUEUE_NORM
+        q_arr = [self.queues[a] / QUEUE_NORM for a in ARMS]
+
+        # [4-7] occupancy per arm — derived from queue (saturation curve, 0-1)
+        # ~30 vehicles ≈ full lane saturation
+        occ_arr = [min(self.queues[a] / 30.0, 1.0) for a in ARMS]
+
+        # [8-11] speed per arm ÷ SPEED_NORM
+        # When queue is small, speed ≈ free-flow; when large, speed → 0
+        spd_arr = [
+            (FREE_FLOW_SPEED * max(0.0, 1.0 - self.queues[a] / 40.0)) / SPEED_NORM
+            for a in ARMS
+        ]
+
+        # [12-15] downstream queue per out ÷ QUEUE_NORM
+        ds_arr = [self.dq[o] / QUEUE_NORM for o in OUTS]
+
+        # [16-19] phase one-hot (over PHASE_GREEN ordering [0,2,4,6])
+        ph_onehot = [1.0 if PHASE_GREEN[i] == phase else 0.0 for i in range(4)]
+
+        # [20] elapsed ÷ MAX_GREEN
+        elapsed_n = min(self.elapsed / MAX_GREEN_NORM, 1.0)
+
+        # [21-22] sin/cos of hour (NOT seconds)
+        hour = (sim_time // 3600) % 24
+        sin_h = math.sin(2 * math.pi * hour / 24)
+        cos_h = math.cos(2 * math.pi * hour / 24)
+
+        # [23-26] starvation wait per phase ÷ STARVATION_HARD
+        wait_arr = [min(self.phase_wait[ph] / STARVATION_HARD, 2.0) for ph in PHASE_GREEN]
+
+        s = q_arr + occ_arr + spd_arr + ds_arr + ph_onehot \
+            + [elapsed_n, sin_h, cos_h] + wait_arr
+        assert len(s) == 27, f"State dim {len(s)} != 27"
         return s
 
 # ═══════════════════════════════════════════════════════════════
@@ -146,13 +238,14 @@ def pick_mp(sim):
     return max(PHASE_GREEN, key=lambda p: sum(sim.queues[a] for a in PHASE_UPSTREAM[p]))
 
 def pick_drl(sim, dqn, pi, sim_time):
-    # Force starved phases first
+    # Force starved phases first (matches training-time hard override)
     for ph in PHASE_GREEN:
         if any(sim.wait[a] >= EQUITY_MAX for a in PHASE_UPSTREAM[ph]):
             return ph
     if dqn:
-        return PHASE_GREEN[dqn.act(sim.build_state(pi, sim_time))]
-    # Fallback: pressure + equity-weighted heuristic (better than pure MP)
+        current_phase = PHASE_GREEN[pi]
+        return PHASE_GREEN[dqn.act(sim.build_state(current_phase, sim_time))]
+    # Fallback: pressure + equity-weighted heuristic
     return max(PHASE_GREEN, key=lambda p:
         sum(sim.queues[a] for a in PHASE_UPSTREAM[p]) +
         0.5 * max(sim.wait[a] for a in PHASE_UPSTREAM[p]))
@@ -236,7 +329,9 @@ def run(mode, speed, no_hw):
     dqn=None
     if mode=="hybrid_drl":
         wp=HERE/"j1_dqn_weights.npz"
-        if wp.exists():
+        if not wp.exists():
+            print(f"[WARN] Weights file not found: {wp}")
+        else:
             try: dqn=DQNInference(str(wp))
             except Exception as e: print(f"[WARN] DQN failed ({e})")
         if not dqn: print("[INFO] Using equity-weighted heuristic for DRL")
@@ -260,11 +355,10 @@ def run(mode, speed, no_hw):
             h=sim_t//3600;m=(sim_t%3600)//60
             q=sim.total_queue();tot_q+=q;ns+=1
             hw.show_lcd(f"{h:02d}:{m:02d} {PHASE_LABEL[ph]}",f"Q:{q:4.0f} {mode[:3]:>3s}")
-            dem=get_demand(sim_t)
             print(f"  {h:02d}:{m:02d}  {PHASE_LABEL[ph]}  "
                   f"Q=[A:{sim.queues['A']:5.1f} B:{sim.queues['B']:5.1f} "
                   f"C:{sim.queues['C']:5.1f} D:{sim.queues['D']:5.1f}]  "
-                  f"tot={q:5.1f}  w=[{sim.wait['A']:.0f},{sim.wait['B']:.0f},{sim.wait['C']:.0f},{sim.wait['D']:.0f}]")
+                  f"tot={q:5.1f}")
             sim.step(ph,sim_t)
             time.sleep(GREEN_S/speed);sim_t+=GREEN_S;ci+=1
     except KeyboardInterrupt: print("\n[STOP]")
